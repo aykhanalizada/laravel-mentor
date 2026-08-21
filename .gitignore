@@ -1,0 +1,9 @@
+.env
+.env.save
+.tg_offset
+bot.log
+mentor.log
+progress.json
+__pycache__/
+*.pyc
+.claude/
