@@ -8,7 +8,7 @@ import argparse
 import subprocess
 import random
 import re
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 import urllib.request
 
@@ -27,7 +27,7 @@ DIFFICULTY_LABELS = {
     "medium":  "🟡 Orta",
     "hard":    "🔴 Çətin",
 }
-DIFFICULTY_XP_MULT = {"starter": 0.8, "easy": 1.0, "medium": 1.5, "hard": 2.2}
+DIFFICULTY_XP_MULT = {"starter": 0.3, "easy": 0.6, "medium": 1.5, "hard": 2.5}
 DIFFICULTY_GUIDE   = {
     "starter": (
         "ÇOXTƏCÜBSÜZ başlanğıc sualı. Tək bir anlayışı soruşur. "
@@ -95,27 +95,70 @@ STARTER_TYPES = ["theory", "code_write", "trick"]
 
 # ── Player level sistemi ───────────────────────────────────────────────────────
 PLAYER_LEVELS = [
-    (0,    1, "🌱 Trainee"),
-    (400,  2, "⚡ Junior"),
-    (1200, 3, "🔥 Junior+"),
-    (2800, 4, "💎 Mid"),
-    (5600, 5, "🚀 Mid+"),
-    (10000,6, "👑 Senior"),
+    (0,     1, "🌱 Trainee"),
+    (2000,  2, "⚡ Junior"),
+    (6000,  3, "🔥 Junior+"),
+    (15000, 4, "💎 Mid"),
+    (30000, 5, "🚀 Mid+"),
+    (60000, 6, "👑 Senior"),
 ]
 
-def get_player_level(xp: int) -> tuple[int, str, int, int]:
-    """(level_num, label, current_xp_in_level, xp_needed_for_next)"""
-    lvl_num, lvl_label = 1, PLAYER_LEVELS[0][2]
-    for i, (threshold, num, label) in enumerate(PLAYER_LEVELS):
-        if xp >= threshold:
-            lvl_num, lvl_label = num, label
+# Keyfiyyət qapıları: level-up üçün XP kifayət deyil — bu şərtlər də ödənməlidir.
+LEVEL_GATES = {
+    2: {"medium_correct": 5},
+    3: {"medium_correct": 15, "hard_correct": 3},
+    4: {"hard_correct": 15, "hard_topics": 5},
+    5: {"hard_correct": 40, "hard_topics": 10},
+    6: {"hard_correct": 80, "hard_topics": 15},
+}
+
+def _count_correct_at(progress: dict, difficulty: str) -> int:
+    return sum(1 for h in progress.get("history", [])
+               if h.get("difficulty") == difficulty
+               and h.get("evaluation", {}).get("score") == "correct")
+
+def _distinct_topics_correct_at(progress: dict, difficulty: str) -> int:
+    return len({h.get("topic") for h in progress.get("history", [])
+                if h.get("difficulty") == difficulty
+                and h.get("evaluation", {}).get("score") == "correct"})
+
+def check_level_gate(progress: dict, target_level: int) -> tuple[bool, list[str]]:
+    gate = LEVEL_GATES.get(target_level, {})
+    missing = []
+    if "medium_correct" in gate:
+        c, r = _count_correct_at(progress, "medium"), gate["medium_correct"]
+        if c < r: missing.append(f"Medium correct: {c}/{r}")
+    if "hard_correct" in gate:
+        c, r = _count_correct_at(progress, "hard"), gate["hard_correct"]
+        if c < r: missing.append(f"Hard correct: {c}/{r}")
+    if "hard_topics" in gate:
+        c, r = _distinct_topics_correct_at(progress, "hard"), gate["hard_topics"]
+        if c < r: missing.append(f"Fərqli hard mövzu: {c}/{r}")
+    return (not missing), missing
+
+def get_player_level(progress: dict) -> tuple[int, str, int, int, list[str]]:
+    """(level_num, label, current_xp_in_level, xp_needed_for_next, gate_missing).
+    Gate keçilməsə XP kifayət olsa belə level yüksəlmir."""
+    xp = progress.get("xp", 0)
+    xp_tier = 1
+    for threshold, num, _ in PLAYER_LEVELS:
+        if xp >= threshold: xp_tier = num
+    effective, gate_missing = 1, []
+    for _, num, _ in PLAYER_LEVELS:
+        if num == 1 or num > xp_tier: continue
+        passed, missing = check_level_gate(progress, num)
+        if passed:
+            effective = num
         else:
+            gate_missing = missing
             break
-    # XP bu leveldə
-    cur_thresh = next(t for t, n, _ in PLAYER_LEVELS if n == lvl_num)
-    next_thresh_list = [t for t, n, _ in PLAYER_LEVELS if n == lvl_num + 1]
-    next_thresh = next_thresh_list[0] if next_thresh_list else cur_thresh + 9999
-    return lvl_num, lvl_label, xp - cur_thresh, next_thresh - cur_thresh
+    eff_label   = next(l for _, n, l in PLAYER_LEVELS if n == effective)
+    cur_thresh  = next(t for t, n, _ in PLAYER_LEVELS if n == effective)
+    next_list   = [t for t, n, _ in PLAYER_LEVELS if n == effective + 1]
+    next_thresh = next_list[0] if next_list else cur_thresh + 9999
+    cur_in_lvl  = max(0, min(xp, next_thresh) - cur_thresh)
+    need_in_lvl = next_thresh - cur_thresh
+    return effective, eff_label, cur_in_lvl, need_in_lvl, gate_missing
 
 def xp_bar(current: int, needed: int, width: int = 10) -> str:
     filled = round(current / needed * width) if needed else width
@@ -146,6 +189,126 @@ def check_badges(progress: dict) -> list[str]:
             new_badges.append(label)
     progress["badges"] = list(earned)
     return new_badges
+
+
+# ── Topic mastery & spaced repetition ────────────────────────────────────────
+REVIEW_INTERVALS = [1, 3, 7, 21, 60]   # gün, Anki-style
+
+# Mastery şərti: kifayət qədər cavab + medium+ correct + orta grade
+MASTERY_MIN_ANSWERS         = 5
+MASTERY_MIN_CORRECT         = 3
+MASTERY_MIN_HIGHEST_DIFF    = "medium"   # ən azı medium correct
+MASTERY_MIN_AVG_GRADE       = 6.5
+
+def _new_topic_stats(difficulty: str = "starter") -> dict:
+    return {
+        "answers": 0, "correct": 0, "partial": 0, "incorrect": 0,
+        "grades_sum": 0, "avg_grade": 0.0,
+        "highest_diff_correct": None,
+        "current_difficulty": difficulty,
+        "consecutive_correct": 0, "consecutive_wrong": 0,
+        "last_asked_date": None,
+        "next_review_date": None,
+        "review_interval_days": 0,
+        "mastered": False,
+    }
+
+def is_topic_mastered(stats: dict) -> bool:
+    if not stats: return False
+    order = DIFFICULTY_ORDER
+    highest = stats.get("highest_diff_correct")
+    return (
+        stats.get("answers", 0) >= MASTERY_MIN_ANSWERS and
+        stats.get("correct", 0) >= MASTERY_MIN_CORRECT and
+        highest is not None and
+        order.index(highest) >= order.index(MASTERY_MIN_HIGHEST_DIFF) and
+        stats.get("avg_grade", 0) >= MASTERY_MIN_AVG_GRADE
+    )
+
+def topic_mastery_pct(stats: dict) -> int:
+    if not stats or stats.get("answers", 0) == 0: return 0
+    order = DIFFICULTY_ORDER
+    ans     = min(stats.get("answers", 0) / MASTERY_MIN_ANSWERS, 1.0)
+    correct = min(stats.get("correct", 0) / MASTERY_MIN_CORRECT, 1.0)
+    grade   = min(stats.get("avg_grade", 0) / 10.0, 1.0)
+    highest = stats.get("highest_diff_correct") or "starter"
+    diff    = order.index(highest) / (len(order) - 1)  # 0..1
+    return round((0.15*ans + 0.25*correct + 0.30*grade + 0.30*diff) * 100)
+
+def compute_next_review(current_interval: int, grade: int, from_date: str | None = None) -> tuple[str, int]:
+    """Qrade-ə görə növbəti review-un tarixini və interval-ı qaytarır."""
+    if grade >= 7:
+        if current_interval in REVIEW_INTERVALS:
+            i = REVIEW_INTERVALS.index(current_interval)
+            new = REVIEW_INTERVALS[min(i + 1, len(REVIEW_INTERVALS) - 1)]
+        else:
+            new = REVIEW_INTERVALS[0]
+    elif grade >= 5:
+        new = current_interval if current_interval > 0 else REVIEW_INTERVALS[0]
+    else:
+        new = REVIEW_INTERVALS[0]
+    base = date.fromisoformat(from_date) if from_date else date.today()
+    return (base + timedelta(days=new)).isoformat(), new
+
+def _bump_topic_difficulty(stats: dict, grade: int) -> str:
+    order = DIFFICULTY_ORDER
+    cur   = stats.get("current_difficulty", "starter")
+    idx   = order.index(cur) if cur in order else 0
+    cc, cw = stats.get("consecutive_correct", 0), stats.get("consecutive_wrong", 0)
+    if grade >= 8:
+        cc += 1; cw = 0
+        if cc >= 2 and idx < len(order) - 1: idx += 1; cc = 0
+    elif grade <= 3:
+        cw += 1; cc = 0
+        if cw >= 2 and idx > 0: idx -= 1; cw = 0
+    else:
+        cc = 0; cw = 0
+    stats["consecutive_correct"], stats["consecutive_wrong"] = cc, cw
+    return order[idx]
+
+def update_topic_stats(progress: dict, topic_id: str, difficulty: str,
+                       grade: int, score: str, today: str) -> dict:
+    all_stats = progress.setdefault("topic_stats", {})
+    s = all_stats.setdefault(topic_id, _new_topic_stats(difficulty))
+    s["answers"]      += 1
+    s[score]           = s.get(score, 0) + 1
+    s["grades_sum"]    = s.get("grades_sum", 0) + grade
+    s["avg_grade"]     = round(s["grades_sum"] / s["answers"], 2)
+    s["last_asked_date"] = today
+    if score == "correct":
+        order = DIFFICULTY_ORDER
+        cur_h = s.get("highest_diff_correct")
+        if cur_h is None or order.index(difficulty) > order.index(cur_h):
+            s["highest_diff_correct"] = difficulty
+    s["current_difficulty"] = _bump_topic_difficulty(s, grade)
+    s["next_review_date"], s["review_interval_days"] = compute_next_review(
+        s.get("review_interval_days", 0), grade, from_date=today
+    )
+    s["mastered"] = is_topic_mastered(s)
+    return s
+
+def _all_topics_with_level(roadmap: dict) -> list[tuple[dict, dict]]:
+    return [(lvl, t) for lvl in roadmap["levels"] for t in lvl["topics"]]
+
+def get_next_topic(roadmap: dict, progress: dict) -> tuple[dict | None, dict | None, bool]:
+    """Prioritet: overdue review > linear cari mövzu.
+    Qaytarır (level, topic, is_review)."""
+    today = date.today().isoformat()
+    topic_stats = progress.get("topic_stats", {})
+    overdue = []
+    for lvl, topic in _all_topics_with_level(roadmap):
+        s = topic_stats.get(topic["id"])
+        if not s or s.get("mastered"): continue
+        nr = s.get("next_review_date")
+        if nr and nr <= today:
+            overdue.append((nr, lvl, topic))
+    if overdue:
+        overdue.sort(key=lambda x: x[0])
+        _, lvl, topic = overdue[0]
+        return lvl, topic, True
+    # Linear
+    lvl, topic = get_current_topic(roadmap, progress)
+    return lvl, topic, False
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────
@@ -354,15 +517,16 @@ def calc_xp(grade: int, difficulty: str, streak: int) -> int:
 
 
 # ── Nəticə formatı ────────────────────────────────────────────────────────────
-def format_evaluation(evaluation: dict, day: int, q_answered: int, streak: int,
-                       xp_earned: int, total_xp: int, new_badges: list[str],
+def format_evaluation(evaluation: dict, progress: dict, streak: int,
+                       xp_earned: int, new_badges: list[str],
                        level_up: bool, new_level_label: str) -> str:
     score   = evaluation.get("score", "partial")
     grade   = evaluation.get("grade", 5)
     emoji   = {"correct": "✅", "partial": "🟡", "incorrect": "❌"}[score]
     bar     = "█" * grade + "░" * (10 - grade)
 
-    lvl_num, lvl_label, lvl_xp, lvl_need = get_player_level(total_xp)
+    total_xp = progress.get("xp", 0)
+    lvl_num, lvl_label, lvl_xp, lvl_need, gate_missing = get_player_level(progress)
     prog_bar = xp_bar(lvl_xp, lvl_need)
 
     lines = [f"{emoji} <b>Qiymət: {grade}/10</b>  {bar}"]
@@ -375,6 +539,10 @@ def format_evaluation(evaluation: dict, day: int, q_answered: int, streak: int,
         f"⚡ <b>+{xp_earned} XP</b>  |  Cəmi: {total_xp} XP",
         f"{lvl_label}  {prog_bar}  {lvl_xp}/{lvl_need} XP",
     ]
+
+    if gate_missing:
+        lines += ["", "🔒 <b>Level-up qapısı bağlı:</b>"]
+        for m in gate_missing: lines.append(f"  • {m}")
 
     if new_badges:
         lines += ["", "🏆 <b>Yeni badge:</b> " + "  ".join(new_badges)]
@@ -393,7 +561,7 @@ def format_evaluation(evaluation: dict, day: int, q_answered: int, streak: int,
     if ns: lines += ["", "🚀 <b>Növbəti addım:</b>", ns]
 
     streak_str = f"  🔥 {streak} gün streak!" if streak > 1 else ""
-    lines += ["", "━━━━━━━━━━━━━━━", f"📅 Gün {day} | Sual #{q_answered}{streak_str}"]
+    lines += ["", "━━━━━━━━━━━━━━━", f"📅 Gün {progress['day']} | Sual #{progress.get('questions_answered', 0)}{streak_str}"]
     return "\n".join(lines)
 
 
@@ -401,26 +569,30 @@ def format_evaluation(evaluation: dict, day: int, q_answered: int, streak: int,
 def cmd_question(args):
     roadmap  = load_json(ROADMAP_FILE)
     progress = load_json(PROGRESS_FILE)
-    level, topic = get_current_topic(roadmap, progress)
+    level, topic, is_review = get_next_topic(roadmap, progress)
 
     if topic is None:
         send_telegram("🎉 Roadmap tamamlandı! Sən artıq Senior Laravel Developer-sən! 👑")
         return
 
-    difficulty = progress.get("difficulty", "starter")
-    q_type     = pick_question_type(topic, progress, difficulty)
+    topic_stats = progress.get("topic_stats", {}).get(topic["id"], {})
+    difficulty  = topic_stats.get("current_difficulty") or "starter"
+    q_type      = pick_question_type(topic, progress, difficulty)
 
-    print(f"⏳ [{difficulty}] {topic['name']} ({q_type})")
+    review_tag = " [🔁 review]" if is_review else ""
+    print(f"⏳ [{difficulty}] {topic['name']}{review_tag} ({q_type})")
     question = generate_question(progress, level, topic, q_type)
 
     pending: dict = {
         "date":       datetime.now().strftime("%Y-%m-%d"),
         "day":        progress["day"],
         "level":      level["name"],
+        "level_id":   level["id"],
         "topic_id":   topic["id"],
         "topic":      topic["name"],
         "q_type":     q_type,
         "difficulty": difficulty,
+        "is_review":  is_review,
         "question":   question,
         "answered":   False,
     }
@@ -434,8 +606,9 @@ def cmd_question(args):
     else:
         answer_hint = "✍️ Cavabını birbaşa Telegram-a yaz!"
 
+    header = "🔁 <b>Review — köhnə mövzu təkrar</b>" if is_review else f"🎯 <b>Gün {progress['day']} — Laravel Mentor</b>"
     send_telegram(
-        f"🎯 <b>Gün {progress['day']} — Laravel Mentor</b>\n\n"
+        f"{header}\n\n"
         f"{question}\n\n"
         f"━━━━━━━━━━━━━━━\n{answer_hint}"
     )
@@ -488,16 +661,14 @@ def process_answer(answer: str) -> str:
     old_xp    = progress.get("xp", 0)
     new_xp    = old_xp + xp_earned
 
-    old_lvl_num, _, _, _ = get_player_level(old_xp)
-    new_lvl_num, new_lvl_label, _, _ = get_player_level(new_xp)
-    level_up = new_lvl_num > old_lvl_num
+    # Köhnə level snapshot-u (gate-lər də history-dən asılıdır → dəyişikliklərdən əvvəl)
+    old_lvl_num, _, _, _, _ = get_player_level(progress)
 
     # Progress güncəllə
     pending.update({"answered": True, "answer": answer, "evaluation": evaluation})
     progress["history"].append(pending)
     progress.pop("pending_question", None)
     progress["xp"]               = new_xp
-    progress["player_level"]     = new_lvl_num
     progress["streak"]           = streak
     progress["last_answer_date"] = today
     progress["score"][evaluation.get("score", "partial")] = \
@@ -511,17 +682,33 @@ def process_answer(answer: str) -> str:
         if topic not in progress.get("weak_topics", []): progress.setdefault("weak_topics", []).append(topic)
 
     progress.setdefault("question_type_history", []).append(pending.get("q_type", "theory"))
-    adjust_difficulty(progress, grade)
 
-    if grade >= 6:
-        progress["current_topic_index"] += 1
+    # Per-topic stats + spaced repetition
+    tid   = pending.get("topic_id")
+    lvlid = pending.get("level_id")
+    score_lbl = evaluation.get("score", "partial")
+    if tid:
+        stats = update_topic_stats(progress, tid, difficulty, grade, score_lbl, today)
+        # Cari linear mövzu mastered olsa → linear cursor irəli
+        if lvlid == progress["current_level"]:
+            roadmap_l = load_json(ROADMAP_FILE)
+            cur_lvl   = next((l for l in roadmap_l["levels"] if l["id"] == lvlid), None)
+            if cur_lvl:
+                cur_idx = progress["current_topic_index"]
+                if cur_idx < len(cur_lvl["topics"]) and cur_lvl["topics"][cur_idx]["id"] == tid and stats["mastered"]:
+                    progress["current_topic_index"] += 1
+
+    # Yeni level (XP + gate)
+    new_lvl_num, new_lvl_label, _, _, _ = get_player_level(progress)
+    level_up = new_lvl_num > old_lvl_num
+    progress["player_level"] = new_lvl_num
 
     new_badges = check_badges(progress)
     save_json(PROGRESS_FILE, progress)
 
     return format_evaluation(
-        evaluation, progress["day"], progress["questions_answered"], streak,
-        xp_earned, new_xp, new_badges,
+        evaluation, progress, streak,
+        xp_earned, new_badges,
         level_up, new_lvl_label
     )
 
@@ -555,15 +742,17 @@ def cmd_answer(args):
 def cmd_status(args):
     progress = load_json(PROGRESS_FILE)
     roadmap  = load_json(ROADMAP_FILE)
-    level, topic = get_current_topic(roadmap, progress)
+    level, topic, is_review = get_next_topic(roadmap, progress)
+    topic_stats_all = progress.get("topic_stats", {})
 
     xp      = progress.get("xp", 0)
     score   = progress["score"]
     total   = sum(score.values())
     streak  = progress.get("streak", 0)
-    diff    = progress.get("difficulty", "starter")
+    cur_topic_stats = topic_stats_all.get(topic["id"], {}) if topic else {}
+    diff    = cur_topic_stats.get("current_difficulty", "starter")
 
-    lvl_num, lvl_label, lvl_xp, lvl_need = get_player_level(xp)
+    lvl_num, lvl_label, lvl_xp, lvl_need, gate_missing = get_player_level(progress)
     prog_bar = xp_bar(lvl_xp, lvl_need)
     pct      = round(score.get("correct", 0) / total * 100) if total else 0
 
@@ -581,6 +770,18 @@ def cmd_status(args):
         else:
             road_lines.append(f"  ⬜ {lv['name']}")
 
+    # Cari level-də mövzu mastery
+    cur_level_obj = next((l for l in all_levels if l["id"] == cur_lid), None)
+    mastery_lines = []
+    today = date.today().isoformat()
+    if cur_level_obj:
+        for t in cur_level_obj["topics"]:
+            s = topic_stats_all.get(t["id"], {})
+            pct_m = topic_mastery_pct(s)
+            bar_m = xp_bar(pct_m, 100, width=8)
+            mark  = "🏆" if s.get("mastered") else ("🔁" if s.get("next_review_date") and s["next_review_date"] <= today else "  ")
+            mastery_lines.append(f"  {mark} {t['name'][:32]:32s}  {bar_m}  {pct_m}%")
+
     badges = progress.get("badges", [])
     badge_labels = {bid: lbl for bid, lbl, _ in BADGE_CHECKS}
     badge_str = "  ".join(badge_labels.get(b, b) for b in badges) if badges else "hələ yoxdur"
@@ -590,12 +791,21 @@ def cmd_status(args):
         f"⚡ <b>{lvl_label}</b>",
         f"{prog_bar}  {lvl_xp}/{lvl_need} XP",
         f"💰 Cəmi XP: {xp}",
+    ]
+    if gate_missing:
+        lines += ["", "🔒 <b>Növbəti level qapısı:</b>"]
+        for m in gate_missing: lines.append(f"  • {m}")
+    lines += [
         "",
         "📍 <b>Yol xəritəsi:</b>",
     ] + road_lines + [
         "",
-        f"🎯 Cari mövzu: <b>{topic['name'] if topic else 'Tamamlandı!'}</b>",
+        f"🎯 Növbəti mövzu: <b>{topic['name'] if topic else 'Tamamlandı!'}</b>" + (" 🔁" if is_review else ""),
         f"⚡ Çətinlik: {DIFFICULTY_LABELS.get(diff)}",
+    ]
+    if mastery_lines:
+        lines += ["", f"📈 <b>{cur_level_obj['name']} — mövzu mastery:</b>"] + mastery_lines
+    lines += [
         "",
         "📊 <b>Statistika:</b>",
         f"  🗓 Gün: {progress['day']}  📝 Sual: {progress.get('questions_answered', 0)}  🔥 Streak: {streak}",
