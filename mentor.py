@@ -804,7 +804,7 @@ def cmd_question(args):
     save_json(PROGRESS_FILE, progress)
 
     if q_type in ("code_write", "debug"):
-        answer_hint = '💻 <b>Kodu buradan yaz:</b> <a href="http://localhost:8731">http://localhost:8731</a>'
+        answer_hint = '💻 <b>Kodu buradan yaz:</b> <a href="http://127.0.0.1:8731">http://127.0.0.1:8731</a>'
     else:
         answer_hint = "✍️ Cavabını birbaşa Telegram-a yaz!"
 

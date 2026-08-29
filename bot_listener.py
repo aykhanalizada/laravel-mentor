@@ -195,7 +195,7 @@ def handle_command(text: str, message_id: int):
                 f"{q}\n\n"
             )
             if q_type in ("code_write", "debug"):
-                msg += '💻 <b>Kodu buradan yaz:</b> <a href="http://localhost:8731">http://localhost:8731</a>'
+                msg += '💻 <b>Kodu buradan yaz:</b> <a href="http://127.0.0.1:8731">http://127.0.0.1:8731</a>'
             else:
                 msg += "✍️ Cavabını birbaşa bura yaz!"
             send(msg)
