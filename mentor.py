@@ -287,6 +287,31 @@ def update_topic_stats(progress: dict, topic_id: str, difficulty: str,
     s["mastered"] = is_topic_mastered(s)
     return s
 
+def rebuild_topic_stats(progress: dict, topic_id: str) -> dict:
+    """Bir mövzunun statistikasını history-dən sıfırdan yenidən qurur.
+    Qiymət sonradan düzəldiləndə lazımdır: update_topic_stats() sayğacları artırır,
+    ona görə düzəliş üçün onu ikinci dəfə çağırmaq cavab sayını ikiqat edərdi.
+    Replay isə interval/consecutive kimi yol-asılı sahələri də dəqiq bərpa edir."""
+    entries = [h for h in progress.get("history", [])
+               if h.get("topic_id") == topic_id and h.get("evaluation")]
+    if not entries:
+        return progress.get("topic_stats", {}).get(topic_id, {})
+
+    progress.setdefault("topic_stats", {})[topic_id] = \
+        _new_topic_stats(entries[0].get("difficulty", "starter"))
+
+    stats = {}
+    for h in entries:
+        ev = h["evaluation"]
+        stats = update_topic_stats(
+            progress, topic_id,
+            h.get("difficulty", "starter"),
+            ev.get("grade", 5),
+            ev.get("score", "partial"),
+            h.get("date") or date.today().isoformat(),
+        )
+    return stats
+
 def _all_topics_with_level(roadmap: dict) -> list[tuple[dict, dict]]:
     return [(lvl, t) for lvl in roadmap["levels"] for t in lvl["topics"]]
 
@@ -323,12 +348,40 @@ def ask_claude(prompt: str) -> str:
     if r.returncode != 0: raise RuntimeError(r.stderr.strip())
     return r.stdout.strip()
 
+def extract_json(text: str) -> dict:
+    """Claude-un mətn cavabından JSON obyektini etibarlı şəkildə çıxarır.
+    Claude bəzən ```json``` fence-i ilə əhatə edir, bəzən xam JSON qaytarır —
+    sadə 'ilk { - son }' kəsimi hər ikisini eyni etibarla tutmur."""
+    candidates = []
+    fence = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+    if fence:
+        candidates.append(fence.group(1).strip())
+    candidates.append(text.strip())
+    s, e = text.find("{"), text.rfind("}") + 1
+    if s >= 0 and e > s:
+        candidates.append(text[s:e])
+
+    for c in candidates:
+        try:
+            return json.loads(c)
+        except json.JSONDecodeError:
+            continue
+    return {}
+
 def escape_html(t: str) -> str:
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def safe_html(text: str) -> str:
-    parts = re.split(r"(<b>.*?</b>|<code>.*?</code>|<i>.*?</i>)", text, flags=re.DOTALL)
-    return "".join(p if p.startswith(("<b>","<code>","<i>")) else escape_html(p) for p in parts)
+    def fence_to_html(m):
+        lang = m.group(1)
+        code = escape_html(m.group(2).strip("\n"))
+        cls  = f' class="language-{lang}"' if lang else ""
+        return f"<pre><code{cls}>{code}</code></pre>"
+
+    text  = re.sub(r"```(\w*)\n?(.*?)```", fence_to_html, text, flags=re.DOTALL)
+    text  = re.sub(r"`([^`\n]+?)`", lambda m: f"<code>{escape_html(m.group(1))}</code>", text)
+    parts = re.split(r"(<b>.*?</b>|<code>.*?</code>|<i>.*?</i>|<pre>.*?</pre>|<a href=\"[^\"]*\">.*?</a>)", text, flags=re.DOTALL)
+    return "".join(p if p.startswith(("<b>","<code>","<i>","<pre>","<a ")) else escape_html(p) for p in parts)
 
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -455,6 +508,7 @@ QAYDALAR:
 - Azərbaycan dilində
 - code_read/debug tiplərdə PHP kodu göstər (``` blokunda, maksimum 20 sətir)
 - Sualın sonunda 3 bullet ilə nəyi cavablandırmalı olduğunu yaz
+- VACİB: bu bullet-lər YALNIZ hansı ASPEKTƏ toxunmaq lazım olduğunu göstərsin (məs. "hansı metoddan istifadə etdiyini", "niyə bu yanaşmanı seçdiyini"). Konkret cavabı (funksiya/metod adları, rule adları, dəqiq sintaksis, düzgün kodu) heç vaxt bullet-lərin içində YAZMA — bu, sualı ifşa edir və tələbə düşünmədən kopyalayır.
 - starter/easy üçün: çox sadə, birbaşa, tək anlayış
 
 DƏQIQ FORMAT:
@@ -500,12 +554,140 @@ Yalnız JSON cavab ver:
   "next_step": "Növbəti öyrənmə tövsiyəsi"
 }}"""
 
-    text = ask_claude(prompt)
-    s, e = text.find("{"), text.rfind("}") + 1
-    if s >= 0 and e > s:
-        try: return json.loads(text[s:e])
-        except json.JSONDecodeError: pass
+    text   = ask_claude(prompt)
+    result = extract_json(text)
+    if result:
+        return result
     return {"score": "partial", "grade": 5, "feedback": text, "missing_points": [], "correct_answer_hint": "", "next_step": ""}
+
+
+# ── Müzakirə (qiymətə etiraz) ─────────────────────────────────────────────────
+def process_discussion(message: str) -> str:
+    """Cavablanmış sualla bağlı əlavə mesajı (etiraz/əlavə izahat) emal edir."""
+    progress = load_json(PROGRESS_FILE)
+    history  = progress.get("history", [])
+    if not history:
+        return "⚠️ Müzakirə ediləcək sual yoxdur. /sual yazaraq yeni sual al."
+
+    entry      = history[-1]
+    evaluation = entry.get("evaluation", {})
+    discussion = entry.setdefault("discussion", [])
+
+    thread = "\n".join(f"Tələbə: {d['student']}\nMentor: {d['mentor']}" for d in discussion)
+
+    prompt = f"""Sən Laravel ekspert mentor-san. Tələbə əvvəlki sual/cavab/qiymətləndirmənlə bağlı sənə yazıb. Bu HƏMİŞƏ qiymətə etiraz demək deyil — çox vaxt sadəcə əlavə sualdır: "boşluğum harda idi", "düzgün cavab necə olardı", "bunu necə öyrənim", ümumi davam sualı və s.
+
+Mövzu: {entry.get('topic', '')}
+Sual: {entry.get('question', '')}
+Tələbənin ilk cavabı: {entry.get('answer', '')}
+Sənin ilk qiymətləndirmən: {evaluation.get('grade', 5)}/10 ({evaluation.get('score', 'partial')})
+İlk rəyin: {evaluation.get('feedback', '')}
+Əskik hesab etdiyin məqamlar: {', '.join(evaluation.get('missing_points', [])) or 'yoxdur'}
+{f"{chr(10)}Əvvəlki müzakirə:{chr(10)}{thread}" if thread else ""}
+Tələbənin yeni mesajı: {message}
+
+TAPŞIRIQ:
+1. Əvvəlcə tələbənin NƏ soruşduğunu diqqətlə oxu:
+   - Əgər bu sual/izahat istəyidirsə (boşluğunu öyrənmək, düzgün cavabı görmək, növbəti addımı bilmək və s.) — birbaşa, faydalı, mentor kimi cavab ver. Qiymətdən danışmaq MƏCBURI deyil, sual nəyə aiddirsə ona cavab ver.
+   - Yalnız tələbə AÇIQ ŞƏKİLDƏ qiymətə etiraz edir və ya haqlı olduğunu sübut etməyə çalışırsa, ilk qiyməti yenidən düşün: həqiqətən haqlıdırsa düzəlt və niyə fikrini dəyişdiyini izah et, deyilsə nəzakətlə amma konkret dəlillərlə izah et.
+2. Səmimi, qısa (3-6 cümlə), konkret ol. Təkrar-təkrar "qiyməti dəyişmirəm" demə — yalnız əgər söhbət elə buna görədirsə.
+3. Qərəzsiz ol, amma özünə güzəştə getmə.
+
+CAVABINI DƏQİQ BU FORMATDA VER, başqa heç nə yazma:
+###META###
+{{"grade_changed": false, "new_grade": {evaluation.get('grade', 5)}, "new_score": "{evaluation.get('score', 'partial')}"}}
+###CAVAB###
+Azərbaycanca tələbəyə birbaşa müraciət, 3-6 cümlə. Bu hissədə dırnaq işarələrini sərbəst istifadə edə bilərsən — JSON deyil, sadə mətndir."""
+
+    text = ask_claude(prompt)
+    if "###CAVAB###" in text:
+        meta_part, response_text = text.split("###CAVAB###", 1)
+        meta = extract_json(meta_part.replace("###META###", ""))
+        result = {
+            "grade_changed": meta.get("grade_changed", False),
+            "new_grade": meta.get("new_grade", evaluation.get("grade", 5)),
+            "new_score": meta.get("new_score", evaluation.get("score", "partial")),
+            "response": response_text.strip(),
+        }
+    else:
+        result = extract_json(text)
+        if not result:
+            result = {"grade_changed": False, "new_grade": evaluation.get("grade", 5),
+                       "new_score": evaluation.get("score", "partial"), "response": text}
+
+    discussion.append({"student": message, "mentor": result.get("response", "")})
+
+    reply_lines = ["💬 <b>Müzakirə:</b>", "", result.get("response", "")]
+
+    old_grade = evaluation.get("grade", 5)
+    new_grade = result.get("new_grade", old_grade)
+    if result.get("grade_changed") and new_grade != old_grade:
+        difficulty = entry.get("difficulty", "easy")
+        streak     = progress.get("streak", 1)
+        delta      = calc_xp(new_grade, difficulty, streak) - calc_xp(old_grade, difficulty, streak)
+
+        old_score = evaluation.get("score", "partial")
+        new_score = result.get("new_score", old_score)
+
+        # Köhnə snapshot-lar — dəyişikliklərdən ƏVVƏL (level gate-ləri history-dən asılıdır)
+        tid          = entry.get("topic_id")
+        topic_name   = entry.get("topic", "")
+        was_mastered = progress.get("topic_stats", {}).get(tid, {}).get("mastered", False)
+        old_lvl_num  = get_player_level(progress)[0]
+
+        progress["xp"] = max(0, progress.get("xp", 0) + delta)
+        if new_score != old_score:
+            progress["score"][old_score] = max(0, progress["score"].get(old_score, 0) - 1)
+            progress["score"][new_score] = progress["score"].get(new_score, 0) + 1
+
+        evaluation["grade"]  = new_grade
+        evaluation["score"]  = new_score
+        entry["evaluation"]  = evaluation
+
+        # Mövzu statistikası + spaced repetition (düzəldilmiş qiymətlə yenidən qurulur)
+        stats = rebuild_topic_stats(progress, tid) if tid else {}
+
+        # Güclü / zəif mövzu siyahıları
+        if topic_name:
+            strong = progress.setdefault("strong_topics", [])
+            weak   = progress.setdefault("weak_topics", [])
+            if new_grade >= 8:
+                if topic_name not in strong: strong.append(topic_name)
+                if topic_name in weak:       weak.remove(topic_name)
+            elif new_grade <= 3:
+                if topic_name not in weak:   weak.append(topic_name)
+                if topic_name in strong:     strong.remove(topic_name)
+
+        # Düzəliş nəticəsində mövzu mənimsənildisə → linear cursor irəli
+        if tid and stats.get("mastered") and not was_mastered \
+                and entry.get("level_id") == progress.get("current_level"):
+            cur_lvl = next((l for l in load_json(ROADMAP_FILE)["levels"]
+                            if l["id"] == entry["level_id"]), None)
+            if cur_lvl:
+                cur_idx = progress.get("current_topic_index", 0)
+                if cur_idx < len(cur_lvl["topics"]) and cur_lvl["topics"][cur_idx]["id"] == tid:
+                    progress["current_topic_index"] = cur_idx + 1
+
+        # Level (XP + gate) yenidən hesablanır
+        new_lvl_num, new_lvl_label, _, _, _ = get_player_level(progress)
+        progress["player_level"] = new_lvl_num
+
+        new_badges = check_badges(progress)
+
+        reply_lines += [
+            "",
+            f"📝 Qiymət düzəldildi: {old_grade}/10 → {new_grade}/10",
+            f"⚡ XP fərqi: {'+' if delta >= 0 else ''}{delta}  |  Cəmi: {progress['xp']} XP",
+        ]
+        if stats and stats.get("mastered") and not was_mastered:
+            reply_lines += ["", f"🎓 <b>{topic_name}</b> mənimsənildi! ({topic_mastery_pct(stats)}%)"]
+        if new_lvl_num > old_lvl_num:
+            reply_lines += ["", f"🎉 <b>LEVEL UP!</b> → {new_lvl_label}"]
+        if new_badges:
+            reply_lines += ["", "🏆 <b>Yeni badge:</b> " + "  ".join(new_badges)]
+
+    save_json(PROGRESS_FILE, progress)
+    return "\n".join(reply_lines)
 
 
 # ── XP hesablaması ────────────────────────────────────────────────────────────
@@ -602,7 +784,7 @@ def cmd_question(args):
     save_json(PROGRESS_FILE, progress)
 
     if q_type in ("code_write", "debug"):
-        answer_hint = "💻 <b>Kodu buradan yaz:</b> http://localhost:7000"
+        answer_hint = '💻 <b>Kodu buradan yaz:</b> <a href="http://localhost:8731">http://localhost:8731</a>'
     else:
         answer_hint = "✍️ Cavabını birbaşa Telegram-a yaz!"
 

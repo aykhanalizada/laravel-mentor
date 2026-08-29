@@ -30,6 +30,13 @@ TYPE_LABELS = {
     "trick": "🎩 PHP Trick",
 }
 
+BOT_COMMANDS = [
+    {"command": "sual",       "description": "Günün sualını al (və ya aktivini göstər)"},
+    {"command": "status",     "description": "Proqresinə bax"},
+    {"command": "ipucu",      "description": "Aktiv sualda ipucu al"},
+    {"command": "komandalar", "description": "Bütün əmrlərin siyahısı"},
+]
+
 
 def tg_api(method: str, data: dict = None) -> dict:
     url = f"https://api.telegram.org/bot{TOKEN}/{method}"
@@ -51,9 +58,17 @@ def escape_html(text: str) -> str:
 
 
 def safe_html(text: str) -> str:
-    parts = re.split(r"(<b>.*?</b>|<code>.*?</code>|<i>.*?</i>)", text, flags=re.DOTALL)
+    def fence_to_html(m):
+        lang = m.group(1)
+        code = escape_html(m.group(2).strip("\n"))
+        cls  = f' class="language-{lang}"' if lang else ""
+        return f"<pre><code{cls}>{code}</code></pre>"
+
+    text = re.sub(r"```(\w*)\n?(.*?)```", fence_to_html, text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]+?)`", lambda m: f"<code>{escape_html(m.group(1))}</code>", text)
+    parts = re.split(r"(<b>.*?</b>|<code>.*?</code>|<i>.*?</i>|<pre>.*?</pre>|<a href=\"[^\"]*\">.*?</a>)", text, flags=re.DOTALL)
     return "".join(
-        part if part.startswith(("<b>", "<code>", "<i>")) else escape_html(part)
+        part if part.startswith(("<b>", "<code>", "<i>", "<pre>", "<a ")) else escape_html(part)
         for part in parts
     )
 
@@ -79,12 +94,40 @@ def run_mentor(cmd: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else f"❌ Xəta: {result.stderr[:300]}"
 
 
+def handle_discussion(message: str, message_id: int):
+    progress = load_json(PROGRESS_FILE)
+    if not progress.get("history"):
+        send("⚠️ Aktiv sual yoxdur. /sual yazaraq yeni sual al.", reply_to=message_id)
+        return
+
+    send("⏳ Fikirləşirəm...", reply_to=message_id)
+
+    result = subprocess.run(
+        ["python3", "-c", f"""
+import sys
+sys.path.insert(0, '{BASE_DIR}')
+import os
+os.environ['TELEGRAM_BOT_TOKEN'] = '{TOKEN}'
+os.environ['TELEGRAM_CHAT_ID'] = '{CHAT_ID}'
+from mentor import process_discussion
+result = process_discussion({json.dumps(message)})
+print(result)
+"""],
+        capture_output=True, text=True, timeout=180
+    )
+
+    if result.returncode == 0:
+        send(result.stdout.strip())
+    else:
+        send(f"❌ Xəta: {result.stderr[:200]}")
+
+
 def handle_answer(answer: str, message_id: int):
     progress = load_json(PROGRESS_FILE)
     pending = progress.get("pending_question")
 
     if not pending or pending.get("answered"):
-        send("⚠️ Aktiv sual yoxdur. /sual yazaraq yeni sual al.", reply_to=message_id)
+        handle_discussion(answer, message_id)
         return
 
     topic = pending.get("topic", "")
@@ -134,7 +177,7 @@ def handle_command(text: str, message_id: int):
                 f"{q}\n\n"
             )
             if q_type in ("code_write", "debug"):
-                msg += "💻 <b>Kodu buradan yaz:</b> http://localhost:7000"
+                msg += '💻 <b>Kodu buradan yaz:</b> <a href="http://localhost:8731">http://localhost:8731</a>'
             else:
                 msg += "✍️ Cavabını birbaşa bura yaz!"
             send(msg)
@@ -187,7 +230,8 @@ def handle_command(text: str, message_id: int):
             "/status — proqresinə bax\n"
             "/ipucu — aktiv sualda ipucu al\n"
             "/komandalar — bu siyahı\n\n"
-            "💬 <b>Sual gəldikdən sonra cavabını birbaşa yaz</b> — bot qiymətləndirir."
+            "💬 <b>Sual gəldikdən sonra cavabını birbaşa yaz</b> — bot qiymətləndirir.\n"
+            "🗣 <b>Qiymətə razı deyilsənsə, cavab gələndən sonra yenə yaz</b> — bot arqumentini dinləyib lazım gələrsə qiyməti düzəldir."
         )
 
 
@@ -229,6 +273,8 @@ def run():
     if not TOKEN or not CHAT_ID:
         print("TELEGRAM_BOT_TOKEN və ya TELEGRAM_CHAT_ID yoxdur.")
         return
+
+    tg_api("setMyCommands", {"commands": BOT_COMMANDS})
 
     print(f"Bot başladı. Chat: {CHAT_ID}")
     send(

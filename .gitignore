@@ -7,3 +7,5 @@ progress.json
 __pycache__/
 *.pyc
 .claude/
+.last_reminder
+web_answer.log
