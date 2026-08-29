@@ -53,18 +53,20 @@ def tg_api(method: str, data: dict = None) -> dict:
         url, data=payload,
         headers={"Content-Type": "application/json"} if payload else {}
     )
-    # api.telegram.org-un AAAA yazısı var, bu maşında isə IPv6 default route yoxdur →
-    # urllib vaxtaşırı [Errno 101] atır. Bir dəfəlik uğursuzluq mesajı itirməməlidir.
+    # Bu şəbəkədən Telegram-a bağlantıların ~33%-i timeout olur (yalnız Telegram —
+    # digər hostlar problemsiz). getUpdates itsə zərəri yoxdur (offset irəliləmir,
+    # Telegram təkrar göndərir), amma sendMessage itsə mesaj yox olur → 5 cəhd.
+    attempts = 5 if method == "sendMessage" else 3
     last_err = None
-    for attempt in range(1, 4):
+    for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(req, timeout=35) as r:
                 return json.loads(r.read())
         except Exception as e:
             last_err = e
-            if attempt < 3:
+            if attempt < attempts:
                 time.sleep(1.5 * attempt)
-    print(f"[API xəta] {method} (3 cəhd): {last_err}")
+    print(f"[API xəta] {method} ({attempts} cəhd): {last_err}")
     return {}
 
 

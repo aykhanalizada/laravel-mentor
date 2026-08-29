@@ -385,11 +385,12 @@ def safe_html(text: str) -> str:
     parts = re.split(r"(<b>.*?</b>|<code>.*?</code>|<i>.*?</i>|<pre>.*?</pre>|<a href=\"[^\"]*\">.*?</a>)", text, flags=re.DOTALL)
     return "".join(p if p.startswith(("<b>","<code>","<i>","<pre>","<a ")) else escape_html(p) for p in parts)
 
-def send_telegram(text: str, retries: int = 4) -> bool:
+def send_telegram(text: str, retries: int = 6) -> bool:
     """Mesajı Telegram-a göndərir. Uğuru bool kimi qaytarır.
-    Bu maşında api.telegram.org üçün AAAA yazısı var, amma IPv6 default route yoxdur —
-    urllib vaxtaşırı [Errno 101] verir. Uğursuzluq səssiz qalmamalıdır: xəta stderr-ə
-    yazılır ki, bot_listener-in log-una düşsün."""
+    Ölçülmüş fakt: bu şəbəkədən Telegram-a TCP bağlantıların ~33%-i timeout olur
+    (Cloudflare/Google/GitHub 12/12 işləyir — yəni problem provayderin Telegram-a
+    olan yolundadır, koddan həll olunmur). Ona görə göndərmə bir neçə dəfə təkrarlanır:
+    6 cəhd → itki ehtimalı ~0.1%. Uğursuzluq səssiz qalmamalıdır — stderr-ə yazılır."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(text); return True
 
@@ -401,7 +402,7 @@ def send_telegram(text: str, retries: int = 4) -> bool:
             data=payload, headers={"Content-Type": "application/json"}
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with urllib.request.urlopen(req, timeout=10) as r:
                 res = json.loads(r.read())
             if res.get("ok"):
                 return True
