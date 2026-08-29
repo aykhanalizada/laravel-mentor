@@ -9,3 +9,6 @@ __pycache__/
 .claude/
 .last_reminder
 web_answer.log
+.env.bak*
+.tg_offset.old-bot
+bot.log.old
