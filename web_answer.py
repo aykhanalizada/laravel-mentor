@@ -12,7 +12,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote_plus
-import force_ipv4  # IPv6-sız şəbəkə üçün, şəbəkə çağırışlarından ƏVVƏL
 
 BASE_DIR = Path(__file__).parent
 PROGRESS_FILE = BASE_DIR / "progress.json"

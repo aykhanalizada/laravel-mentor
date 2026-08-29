@@ -14,8 +14,6 @@ import urllib.request
 import urllib.error
 import time
 
-import force_ipv4  # IPv6-sız şəbəkə üçün, şəbəkə çağırışlarından ƏVVƏL
-
 BASE_DIR = Path(__file__).parent
 ROADMAP_FILE  = BASE_DIR / "roadmap.json"
 PROGRESS_FILE = BASE_DIR / "progress.json"

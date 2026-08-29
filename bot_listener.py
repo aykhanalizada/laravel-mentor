@@ -12,7 +12,6 @@ import urllib.request
 import re
 from pathlib import Path
 from datetime import datetime
-import force_ipv4  # IPv6-sız şəbəkə üçün, şəbəkə çağırışlarından ƏVVƏL
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
