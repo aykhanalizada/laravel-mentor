@@ -38,6 +38,14 @@ BOT_COMMANDS = [
 ]
 
 
+def _log_child_stderr(tag: str, result) -> None:
+    """mentor.py səssiz uğursuzluqları (məs. Telegram göndərilmədi) stderr-ə yazır,
+    lakin çıxış kodu 0 qalır — ona görə stderr həmişə log-a köçürülür."""
+    err = (getattr(result, "stderr", "") or "").strip()
+    if err:
+        print(f"[{tag} stderr] {err[:500]}")
+
+
 def tg_api(method: str, data: dict = None) -> dict:
     url = f"https://api.telegram.org/bot{TOKEN}/{method}"
     payload = json.dumps(data).encode("utf-8") if data else None
@@ -45,12 +53,19 @@ def tg_api(method: str, data: dict = None) -> dict:
         url, data=payload,
         headers={"Content-Type": "application/json"} if payload else {}
     )
-    try:
-        with urllib.request.urlopen(req, timeout=35) as r:
-            return json.loads(r.read())
-    except Exception as e:
-        print(f"[API xəta] {method}: {e}")
-        return {}
+    # api.telegram.org-un AAAA yazısı var, bu maşında isə IPv6 default route yoxdur →
+    # urllib vaxtaşırı [Errno 101] atır. Bir dəfəlik uğursuzluq mesajı itirməməlidir.
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=35) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            last_err = e
+            if attempt < 3:
+                time.sleep(1.5 * attempt)
+    print(f"[API xəta] {method} (3 cəhd): {last_err}")
+    return {}
 
 
 def escape_html(text: str) -> str:
@@ -91,6 +106,7 @@ def run_mentor(cmd: str) -> str:
         capture_output=True, text=True, timeout=180,
         env={**os.environ, "TELEGRAM_BOT_TOKEN": TOKEN, "TELEGRAM_CHAT_ID": CHAT_ID}
     )
+    _log_child_stderr("mentor", result)
     return result.stdout.strip() if result.returncode == 0 else f"❌ Xəta: {result.stderr[:300]}"
 
 
@@ -116,6 +132,7 @@ print(result)
         capture_output=True, text=True, timeout=180
     )
 
+    _log_child_stderr("mentor", result)
     if result.returncode == 0:
         send(result.stdout.strip())
     else:
@@ -155,6 +172,7 @@ print(result)
         capture_output=True, text=True, timeout=180
     )
 
+    _log_child_stderr("mentor", result)
     if result.returncode == 0:
         send(result.stdout.strip())
     else:
@@ -189,6 +207,7 @@ def handle_command(text: str, message_id: int):
             capture_output=True, text=True, timeout=180,
             env={**os.environ, "TELEGRAM_BOT_TOKEN": TOKEN, "TELEGRAM_CHAT_ID": CHAT_ID}
         )
+        _log_child_stderr("mentor", result)
         if result.returncode != 0:
             send(f"❌ Xəta: {result.stderr[:200]}")
 
@@ -199,6 +218,7 @@ def handle_command(text: str, message_id: int):
             capture_output=True, text=True, timeout=30,
             env={**os.environ, "TELEGRAM_BOT_TOKEN": TOKEN, "TELEGRAM_CHAT_ID": CHAT_ID}
         )
+        _log_child_stderr("mentor", result)
         if result.returncode != 0:
             send(f"❌ Xəta: {result.stderr[:200]}")
 

@@ -11,6 +11,8 @@ import re
 from datetime import datetime, date, timedelta
 from pathlib import Path
 import urllib.request
+import urllib.error
+import time
 
 BASE_DIR = Path(__file__).parent
 ROADMAP_FILE  = BASE_DIR / "roadmap.json"
@@ -383,20 +385,38 @@ def safe_html(text: str) -> str:
     parts = re.split(r"(<b>.*?</b>|<code>.*?</code>|<i>.*?</i>|<pre>.*?</pre>|<a href=\"[^\"]*\">.*?</a>)", text, flags=re.DOTALL)
     return "".join(p if p.startswith(("<b>","<code>","<i>","<pre>","<a ")) else escape_html(p) for p in parts)
 
-def send_telegram(text: str):
+def send_telegram(text: str, retries: int = 4) -> bool:
+    """Mesajı Telegram-a göndərir. Uğuru bool kimi qaytarır.
+    Bu maşında api.telegram.org üçün AAAA yazısı var, amma IPv6 default route yoxdur —
+    urllib vaxtaşırı [Errno 101] verir. Uğursuzluq səssiz qalmamalıdır: xəta stderr-ə
+    yazılır ki, bot_listener-in log-una düşsün."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(text); return
+        print(text); return True
+
     payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": safe_html(text), "parse_mode": "HTML"}).encode()
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        data=payload, headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            res = json.loads(r.read())
-            if not res.get("ok"): print(f"[Telegram xəta] {res}")
-    except Exception as e:
-        print(f"[Telegram xəta] {e}")
+    last_err = None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data=payload, headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                res = json.loads(r.read())
+            if res.get("ok"):
+                return True
+            last_err = res                      # 400/parse xətası — təkrar cəhd kömək etməz
+            break
+        except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code}: {e.read()[:200]!r}"
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+
+    print(f"[Telegram xəta] göndərilmədi ({retries} cəhd): {last_err}", file=sys.stderr)
+    return False
 
 
 # ── Roadmap naviqasiyası ───────────────────────────────────────────────────────
